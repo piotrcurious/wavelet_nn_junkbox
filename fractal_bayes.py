@@ -2,216 +2,217 @@
 fractal_bayes.py
 Fractal-Bayesian hybrid inference for audio separation.
 
-Key pieces:
- - wavelet_coeffs: compute dyadic wavelet coeffs (pywt)
- - estimate_scaling_exponent: fit power-law variance vs scale (simple fractal estimator)
- - compute_multifractal_signature: optional (structure functions tau(q))
- - fractal_prior_from_scaling: produce prior variances per scale (power-law)
- - bayesian_shrinkage_on_coeffs: posterior mean (Wiener-like shrinkage using fractal prior)
- - FractalBayesRefiner: wrapper that computes refined reconstruction + loss term
+This module provides tools for:
+1. Feature Extraction: Multi-scale wavelet analysis.
+2. Prior Estimation: Estimating fractal scaling (power-law) from reference signals.
+3. Post-processing Refinement: Bayesian shrinkage of wavelet coefficients.
+
+Note: This implementation primarily uses NumPy/PyWavelets and is intended for
+post-processing or non-differentiable inference. Gradients will NOT flow through
+the FractalBayesRefiner or any analysis functions in this module.
 """
 
 import numpy as np
 import pywt
 import torch
-import torch.nn.functional as F
 
-# ---------- Helpers: wavelet analysis ----------
-def dyadic_wavelet_coeffs_np(x, wavelet='db4', max_level=None):
+# ---------- 1. Feature Extraction ----------
+
+def analyze_wavelet_coeffs(x, wavelet='db4', max_level=None):
     """
-    x: 1D numpy signal
-    returns: list of detail coeff arrays [d1, d2, ..., dJ] and approximation aJ
-      where d1 is finest scale (highest freq) and dJ coarsest detail.
-    Uses pywt.wavedec (dyadic).
+    Decompose signal into wavelet coefficients.
+    x: 1D numpy array.
+    returns: details [d1, d2, ..., dJ] and approximation aJ.
     """
+    if x.ndim > 1:
+        x = x.ravel()
+
+    # Validate signal length
+    min_len = pywt.Wavelet(wavelet).dec_len
+    if len(x) < min_len:
+        return [], x
+
+    max_l = pywt.dwt_max_level(len(x), pywt.Wavelet(wavelet).dec_len)
     if max_level is None:
-        max_level = pywt.dwt_max_level(len(x), pywt.Wavelet(wavelet).dec_len)
-    coeffs = pywt.wavedec(x, wavelet, level=max_level, mode='symmetric')
-    # coeffs = [aJ, dJ, dJ-1, ..., d1] -> we will return details increasing scale order
+        level = max_l
+    else:
+        level = min(max_level, max_l)
+
+    if level <= 0:
+        return [], x
+
+    coeffs = pywt.wavedec(x, wavelet, level=level, mode='symmetric')
+    # coeffs = [aJ, dJ, dJ-1, ..., d1]
     aJ = coeffs[0]
-    details = coeffs[1:][::-1]  # reverse so details[0] = d1 (finest)
+    details = coeffs[1:][::-1] # [d1, d2, ..., dJ] where d1 is finest
     return details, aJ
 
-def dyadic_wavelet_coeffs_torch(x, wavelet='db4', max_level=None):
+def analyze_wavelet_coeffs_torch(x, wavelet='db4', max_level=None):
     """
-    x: torch tensor (1,T) or (B,1,T) -> we handle single example here for simplicity (1,T)
-    returns details as list of tensors (torch)
+    Torch-wrapped version of analyze_wavelet_coeffs.
+    Note: Still uses NumPy internally; gradients do not flow.
     """
     device = x.device
-    # Handle shape-fragile squeeze: explicitly convert to 1D
     x_np = x.detach().cpu().numpy()
-    if x_np.ndim > 1:
-        x_np = x_np.ravel()
-    dlist, aJ = dyadic_wavelet_coeffs_np(x_np, wavelet=wavelet, max_level=max_level)
-    return [torch.from_numpy(d.astype(np.float32)).to(device) for d in dlist], torch.from_numpy(aJ.astype(np.float32)).to(device)
+    details_np, aJ_np = analyze_wavelet_coeffs(x_np, wavelet, max_level)
 
-# ---------- Fractal / scaling estimation ----------
-def estimate_power_law_variance(details_list):
-    """
-    Given list of detail coeff arrays [d1, d2, ..., dJ] (each 1D numpy),
-    compute var_j = variance(d_j) and fit log(var_j) = c + s*log(scale_j)
-    dyadic scales: scale_j = 2^j (j=1..J)
-    returns slope s and intercept c (where slope relates to fractal H)
-    """
-    var_j = np.array([np.var(d) + 1e-12 for d in details_list])
-    J = len(var_j)
-    scales = np.array([2.0**(j+1) for j in range(J)])  # j=0->scale 2^1 for d1
-    logv = np.log(var_j)
-    logs = np.log(scales)
-    A = np.vstack([logs, np.ones_like(logs)]).T
-    s, c = np.linalg.lstsq(A, logv, rcond=None)[0]
-    return float(s), float(c), var_j, scales
+    details = [torch.from_numpy(d.astype(np.float32)).to(device) for d in details_np]
+    aJ = torch.from_numpy(aJ_np.astype(np.float32)).to(device)
+    return details, aJ
 
-# ---------- Multifractal signature (optional, structure function tau(q)) ----------
-def compute_structure_function(details_list, q_list=[-2,-1,0,1,2], eps=1e-12):
+# ---------- 2. Prior Estimation ----------
+
+def estimate_fractal_scaling(details_list):
     """
-    Compute S(q,j) = mean(|d_j|^q) for each scale j, then fit tau(q)
-    returns tau(q) approx vector where tau(q) = slope log2 S(q,j) vs j
+    Estimate power-law variance slope: log(var) = c + s * log(scale).
+    details_list: [d1, d2, ..., dJ]
+    returns: slope (s), intercept (c).
     """
+    if not details_list:
+        return 0.0, 0.0
+
+    # Compute variance per scale
+    # Weighted regression: coarser scales have fewer coefficients, so we give them less weight
+    variances = []
+    weights = []
+    scales = []
+
+    for j, d in enumerate(details_list):
+        v = np.var(d) + 1e-12
+        variances.append(v)
+        scales.append(2.0**(j+1))
+        weights.append(np.sqrt(len(d))) # weight proportional to sqrt of sample size
+
+    log_v = np.log(variances)
+    log_s = np.log(scales)
+
+    # Weighted least squares
+    W = np.diag(weights)
+    A = np.vstack([log_s, np.ones_like(log_s)]).T
+    # Solve (A^T W A) x = A^T W b
+    try:
+        sol = np.linalg.lstsq(W @ A, W @ log_v, rcond=None)[0]
+        s, c = sol
+    except:
+        s, c = 0.0, 0.0
+
+    return float(s), float(c)
+
+def compute_multifractal_signature(details_list, q_list=[-2, -1, 0, 1, 2], eps=1e-8):
+    """
+    Compute structure function tau(q) describing scaling of q-th moments.
+    """
+    if not details_list:
+        return []
+
     J = len(details_list)
-    S = []
+    out = []
     for q in q_list:
-        # Clamp before exponentiation for negative q to avoid division by zero
-        vals = np.array([np.mean((np.abs(d) + eps)**q) for d in details_list])
-        # regress log2(vals) vs j
-        js = np.arange(1, J+1)
-        logvals = np.log2(vals + eps)
+        # Use log-domain for stability with negative q
+        # S(q, j) = mean(|d_j|^q)
+        # Avoid exploding values by clipping abs(d) from below
+        moments = []
+        for d in details_list:
+            m = np.mean((np.abs(d) + eps) ** q)
+            moments.append(m)
+
+        js = np.arange(1, J + 1)
+        log_m = np.log2(np.array(moments) + eps)
         A = np.vstack([js, np.ones_like(js)]).T
-        slope, intercept = np.linalg.lstsq(A, logvals, rcond=None)[0]
-        S.append((q, float(slope)))  # slope is tau(q)
-    # return list of (q, tau(q))
-    return S
+        slope, _ = np.linalg.lstsq(A, log_m, rcond=None)[0]
+        out.append((q, float(slope)))
+    return out
 
-# ---------- Fractal-driven prior ----------
-def fractal_prior_variance_from_slope(slope, base_scale_variance=1.0, J=6):
-    """
-    Given slope from log(var) vs log(scale), create prior variance per dyadic scale j:
-    model var_prior(scale_j) = base_scale_variance * scale_j^{slope}
-    return numpy array var_prior[j] for j=1..J
-    """
-    scales = np.array([2.0**(j+1) for j in range(J)])  # j indexing consistent
-    var_prior = base_scale_variance * (scales ** slope)
-    # normalize to unit mean to avoid huge magnitudes
-    var_prior = var_prior / (np.mean(var_prior) + 1e-12)
-    return var_prior
+# ---------- 3. Post-processing Refinement ----------
 
-# ---------- Bayesian shrinkage on coefficients ----------
-def posterior_shrinkage_coeffs(pcoef, tcoef, prior_variances, noise_variance_est=None):
+def apply_bayesian_shrinkage(coeffs, prior_var, noise_var):
     """
-    pcoef, tcoef: numpy arrays shaped (n_atoms, Tcoef) or (n_channels, n_atoms, T)
-      We operate per-scale. Simpler: assume pcoef is shape (n_atoms, Tpos).
-    prior_variances: scalar or vector (per-atom or per-scale) giving prior var of coefficient values
-    noise_variance_est: estimated observation noise variance (scalar)
-    We implement a Wiener-like shrinkage posterior mean:
-      post_mean = (prior_var / (prior_var + noise_var)) * observed_coef
-    Returns posterior coefficients array of same shape.
+    Perform Wiener-like shrinkage: E[s|x] = (v_s / (v_s + v_n)) * x
     """
-    if noise_variance_est is None:
-        # estimate noise variance from robust MAD to avoid data leakage from target
-        # robust MAD
-        noise_variance_est = (np.median(np.abs(pcoef - np.median(pcoef))) / 0.6745)**2 + 1e-12
-    # ensure shapes broadcast: prior_variances can be scalar or (n_atoms,) or (1,n_atoms,1)
-    prior = np.asarray(prior_variances)
-    # broadcast prior to pcoef shape
-    while prior.ndim < pcoef.ndim:
-        prior = prior[..., None]
-    shrinkage = prior / (prior + noise_variance_est + 1e-12)
-    post = shrinkage * pcoef
-    return post, noise_variance_est, shrinkage
+    shrinkage = prior_var / (prior_var + noise_var + 1e-12)
+    return shrinkage * coeffs, shrinkage
 
-# ---------- Combine into a refiner class ----------
 class FractalBayesRefiner:
-    """
-    High-level wrapper: given instrument atoms (per-scale) and a predicted signal,
-    compute wavelet/atom coefficients, estimate fractal slope from reference signals,
-    do Bayesian shrinkage on predicted coefficients (fractal prior), reconstruct refined signal.
-    Also computes an L2 loss term between refined and target to use as auxiliary loss.
-    """
-    def __init__(self, atom_banks, wavelet='db4', max_level=6, device='cpu'):
-        """
-        atom_banks: dict {inst_name: {'banks':[np.atoms_scale1, atoms_scale2, ...], 'ref_signals':[list of numpy signals for fractal estimation]}}
-        atoms_scale: numpy array (n_atoms, atom_len)
-        """
-        self.atom_banks = atom_banks
+    def __init__(self, wavelet='db4', max_level=6):
         self.wavelet = wavelet
         self.max_level = max_level
-        self.device = device
+        self.reference_priors = {} # Store slopes per instrument
 
-    def estimate_fractal_prior_for_inst(self, inst_name):
+    def train_prior(self, inst_name, ref_signals):
         """
-        Estimate slope from provided ref_signals for instrument inst_name.
-        Returns prior_variances_per_scale (numpy vector len=J)
+        Learn typical fractal slope for an instrument.
+        ref_signals: list of 1D numpy arrays.
         """
-        ref_sig_list = self.atom_banks[inst_name].get('ref_signals', [])
-        # compute average slope across reference list
         slopes = []
-        for s in ref_sig_list:
-            # Validate max_level against signal length
-            max_l = pywt.dwt_max_level(len(s), pywt.Wavelet(self.wavelet).dec_len)
-            l = min(self.max_level, max_l)
-            dlist, aJ = dyadic_wavelet_coeffs_np(s, wavelet=self.wavelet, max_level=l)
-            s_slope, c, var_j, scales = estimate_power_law_variance(dlist)
-            slopes.append(s_slope)
-        if len(slopes) == 0:
-            slope = -1.0  # fallback conservative value
+        for s in ref_signals:
+            details, _ = analyze_wavelet_coeffs(s, self.wavelet, self.max_level)
+            slope, _ = estimate_fractal_scaling(details)
+            slopes.append(slope)
+
+        if slopes:
+            self.reference_priors[inst_name] = np.median(slopes)
         else:
-            slope = float(np.median(slopes))
-        # produce prior variance per scale
-        var_prior = fractal_prior_variance_from_slope(slope, base_scale_variance=1.0, J=self.max_level)
-        return var_prior, slope
+            self.reference_priors[inst_name] = -1.0 # fallback
 
-    def refine_prediction(self, pred_signal, target_signal, inst_name, atoms_scale_list=None):
+    def refine(self, pred_signal, inst_name, target_signal=None):
         """
-        pred_signal, target_signal: 1D numpy arrays (same length)
-        atoms_scale_list: (Optional) list of atom matrices corresponding to scales (n_atoms, atom_len)
-        returns refined_signal (1D numpy), auxiliary_loss (float), diagnostics dict
-
-        Note: This refiner is currently non-differentiable (NumPy-based) and intended for post-processing.
+        Apply fractal-driven Bayesian shrinkage to the prediction.
+        target_signal: if provided, only used for auxiliary loss computation (not for shrinkage).
         """
-        # 1) compute dyadic wavelet details
-        # Validate max_level against signal length
-        max_l = pywt.dwt_max_level(len(pred_signal), pywt.Wavelet(self.wavelet).dec_len)
-        l = min(self.max_level, max_l)
-        dlist_pred, aJ = dyadic_wavelet_coeffs_np(pred_signal, wavelet=self.wavelet, max_level=l)
-        J = len(dlist_pred)
+        # 1. Analyze
+        details, aJ = analyze_wavelet_coeffs(pred_signal, self.wavelet, self.max_level)
+        if not details:
+            return pred_signal, 0.0, {'status': 'too_short'}
 
-        # 2) compute fractal prior var per scale from ref_signals
-        var_prior_scales, slope = self.estimate_fractal_prior_for_inst(inst_name)
-        var_prior_scales = var_prior_scales[:J]
+        J = len(details)
 
-        # 3) Apply Bayesian shrinkage on wavelet coefficients
-        refined_coeffs = [aJ] # List for waverec: [aJ, dJ, dJ-1, ..., d1]
-        residual_noise_vars = []
-        shrinkage_gains = []
+        # 2. Get prior scaling
+        slope = self.reference_priors.get(inst_name, -1.0)
+        # Prior variance model: var(scale) = base * scale^slope
+        # We can estimate base from the overall energy of pred_signal
+        scales = np.array([2.0**(j+1) for j in range(J)])
+        prior_vars = scales ** slope
+        # Normalize prior_vars to have similar scale as details
+        total_detail_var = np.mean([np.var(d) for d in details])
+        prior_vars = prior_vars * (total_detail_var / (np.mean(prior_vars) + 1e-12))
 
-        # dlist_pred is [d1, d2, ..., dJ] (finest to coarsest)
-        # we need to reverse for waverec
-        for si in range(J-1, -1, -1):
-            d = dlist_pred[si]
-            prior_var = var_prior_scales[si]
-            # No target signal used here to avoid leakage during inference
-            post, noise_var, shrink = posterior_shrinkage_coeffs(d, None, prior_variances=prior_var)
-            refined_coeffs.append(post)
-            residual_noise_vars.append(noise_var)
-            shrinkage_gains.append(shrink)
+        # 3. Estimate noise variance
+        # Standard wavelet heuristic: estimate noise from d1 (finest scale)
+        # using Robust Median Absolute Deviation (MAD)
+        d1 = details[0]
+        noise_std = np.median(np.abs(d1)) / 0.6745
+        noise_var = noise_std**2
 
-        # 4) Proper inverse transform
-        refined = pywt.waverec(refined_coeffs, self.wavelet, mode='symmetric')
+        # 4. Shrink
+        refined_details = []
+        shrinkage_stats = []
+        for j in range(J):
+            refined_d, shrink = apply_bayesian_shrinkage(details[j], prior_vars[j], noise_var)
+            refined_details.append(refined_d)
+            shrinkage_stats.append(float(np.mean(shrink)))
 
-        # Ensure length matches original
+        # 5. Synthesize
+        # waverec expects [aJ, dJ, dJ-1, ..., d1]
+        rec_coeffs = [aJ] + refined_details[::-1]
+        refined = pywt.waverec(rec_coeffs, self.wavelet, mode='symmetric')
+
+        # Match length
         if len(refined) > len(pred_signal):
             refined = refined[:len(pred_signal)]
         elif len(refined) < len(pred_signal):
             refined = np.pad(refined, (0, len(pred_signal) - len(refined)))
 
-        # 5) compute auxiliary loss L2 between refined and target
-        aux_loss = float(np.mean((refined - target_signal)**2))
+        # 6. Metrics
+        aux_loss = 0.0
+        if target_signal is not None:
+            if target_signal.shape == refined.shape:
+                aux_loss = float(np.mean((refined - target_signal)**2))
 
         diagnostics = {
             'slope': slope,
-            'var_prior_scales': var_prior_scales.tolist(),
-            'residual_noise_vars': [float(v) for v in residual_noise_vars],
-            'mean_shrinkage': float(np.mean([np.mean(s) for s in shrinkage_gains])),
-            'nans_detected': np.isnan(refined).any() or np.isinf(refined).any()
+            'noise_var': float(noise_var),
+            'avg_shrinkage': float(np.mean(shrinkage_stats)),
+            'nans_detected': bool(np.isnan(refined).any() or np.isinf(refined).any())
         }
+
         return refined, aux_loss, diagnostics
