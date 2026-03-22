@@ -11,7 +11,13 @@ def generate_tone(freq, duration, sr=16000, harmonics=True):
         x += 0.2 * np.sin(4 * np.pi * freq * t)
         x += 0.1 * np.sin(6 * np.pi * freq * t)
         x += 0.05 * np.sin(8 * np.pi * freq * t)
-    return x.astype(np.float32)
+    # Apply ADR envelope
+    env = np.ones_like(x)
+    att_len = int(0.1 * sr)
+    rel_len = int(0.2 * sr)
+    env[:att_len] = np.linspace(0, 1, att_len)
+    env[-rel_len:] = np.linspace(1, 0, rel_len)
+    return (x * env).astype(np.float32)
 
 def generate_fm_tone(carrier_freq, mod_freq, mod_index, duration, sr=16000):
     t = np.linspace(0, duration, int(sr * duration), endpoint=False)

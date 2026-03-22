@@ -37,9 +37,10 @@ def dyadic_wavelet_coeffs_torch(x, wavelet='db4', max_level=None):
     x: torch tensor (1,T) or (B,1,T) -> we handle single example here for simplicity (1,T)
     returns details as list of tensors (torch)
     """
+    device = x.device
     x_np = x.detach().cpu().numpy().squeeze()
     dlist, aJ = dyadic_wavelet_coeffs_np(x_np, wavelet=wavelet, max_level=max_level)
-    return [torch.from_numpy(d.astype(np.float32)) for d in dlist], torch.from_numpy(aJ.astype(np.float32))
+    return [torch.from_numpy(d.astype(np.float32)).to(device) for d in dlist], torch.from_numpy(aJ.astype(np.float32)).to(device)
 
 # ---------- Fractal / scaling estimation ----------
 def estimate_power_law_variance(details_list):

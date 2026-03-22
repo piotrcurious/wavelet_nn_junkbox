@@ -55,6 +55,21 @@ def test_enhanced_separator():
     out = sep(x)
     assert out.shape == x.shape
 
+def test_silent_input():
+    sep = EnhancedSeparator()
+    x = torch.zeros(1, 1, 1024)
+    out = sep(x)
+    assert out.shape == x.shape
+    assert not torch.isnan(out).any()
+
+def test_variable_input_length():
+    sep = EnhancedSeparator()
+    lengths = [1024, 2048, 4096, 8192]
+    for L in lengths:
+        x = torch.randn(1, 1, L)
+        out = sep(x)
+        assert out.shape == x.shape
+
 def test_instrument_wavelet_loss():
     # Setup mock bank
     atoms = np.random.randn(16, 128).astype(np.float32)
