@@ -28,6 +28,18 @@ def test_dyadic_wavelet_coeffs_torch():
     assert isinstance(details[0], torch.Tensor)
     assert isinstance(aJ, torch.Tensor)
 
+def test_dyadic_wavelet_coeffs_torch_shape_fragility():
+    # Test (B, 1, T)
+    x = torch.randn(2, 1, 1024)
+    details, aJ = dyadic_wavelet_coeffs_torch(x, wavelet='db4', max_level=3)
+    # Ravel makes it one big 1D signal
+    assert len(details) == 3
+
+    # Test (1, 1, T)
+    x = torch.randn(1, 1, 1024)
+    details, aJ = dyadic_wavelet_coeffs_torch(x, wavelet='db4', max_level=3)
+    assert len(details) == 3
+
 def test_estimate_power_law_variance():
     # Create signals with a specific scaling
     details = [np.random.randn(100) * (2.0**j) for j in range(4)]
@@ -47,6 +59,14 @@ def test_compute_structure_function():
     assert S[0][0] == 1
     assert isinstance(S[0][1], float)
 
+def test_compute_structure_function_negative_q():
+    # Signal with some zeros
+    details = [np.zeros(10) for _ in range(3)]
+    # Should not blow up
+    S = compute_structure_function(details, q_list=[-1, -2])
+    assert len(S) == 2
+    assert not np.isnan(S[0][1])
+
 def test_fractal_prior_variance_from_slope():
     var_prior = fractal_prior_variance_from_slope(slope=1.5, J=4)
     assert len(var_prior) == 4
@@ -58,9 +78,10 @@ def test_posterior_shrinkage_coeffs():
     pcoef = np.ones((5, 100))
     tcoef = np.ones((5, 100)) * 0.5
     prior_vars = 1.0
-    post, noise_var, shrink = posterior_shrinkage_coeffs(pcoef, tcoef, prior_vars)
+    # Test without tcoef (default)
+    post, noise_var, shrink = posterior_shrinkage_coeffs(pcoef, None, prior_vars)
     assert post.shape == pcoef.shape
-    assert 0 < shrink < 1
+    assert 0 <= shrink <= 1
 
 def test_fractal_bayes_refiner():
     # Mock atom banks
@@ -80,9 +101,22 @@ def test_fractal_bayes_refiner():
     target_signal = np.random.randn(2048)
 
     refined, aux_loss, diagnostics = refiner.refine_prediction(
-        pred_signal, target_signal, 'inst1', [atoms_scale1, atoms_scale2]
+        pred_signal, target_signal, 'inst1'
     )
 
     assert refined.shape == pred_signal.shape
     assert aux_loss >= 0
     assert 'slope' in diagnostics
+    assert not diagnostics['nans_detected']
+
+def test_fractal_bayes_refiner_short_signal():
+    ref_sig = np.random.randn(2048)
+    atom_banks = {'inst1': {'ref_signals': [ref_sig]}}
+    refiner = FractalBayesRefiner(atom_banks, max_level=10) # Level too high for short signal
+
+    short_sig = np.random.randn(100)
+    target = np.random.randn(100)
+
+    # Should not raise exception
+    refined, aux_loss, diagnostics = refiner.refine_prediction(short_sig, target, 'inst1')
+    assert refined.shape == short_sig.shape
