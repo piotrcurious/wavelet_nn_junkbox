@@ -93,6 +93,8 @@ class SmallUNet(nn.Module):
         e2 = F.relu(self.enc2(e1))
         b = F.relu(self.bott(e2))
         d2 = F.relu(self.dec2(b))
+        if d2.shape[-1] != e1.shape[-1]:
+            d2 = F.interpolate(d2, size=e1.shape[-1], mode='linear', align_corners=False)
         d2 = torch.cat([d2, e1], dim=1)
         out = self.outc(d2)
         return out
@@ -171,7 +173,7 @@ class EpistemicAgent:
         mix = mix.to(self.device)
         pred = pred.to(self.device)
         # Using integrated gradients: input is mix, target output channel (sum over time)
-        ig = IntegratedGradients(model)
+        ig = IntegratedGradients(lambda x: model(x).sum(dim=-1))
         # flatten to (1,1,T) if needed
         attributions = ig.attribute(mix, target=0, n_steps=30)  # (1,1,T)
         # compute atom coefficients for target (CPU)
@@ -184,6 +186,11 @@ class EpistemicAgent:
             tcoef = F.conv1d(target.to(self.device), kernel, padding=pad).abs()
             # compute where tcoef is large -> we expect attribution there
             mask = (tcoef.mean(dim=1, keepdim=True) > (tcoef.mean() * 0.6)).float()
+            # Ensure mask matches attributions size
+            if mask.shape[-1] > attributions.shape[-1]:
+                mask = mask[..., :attributions.shape[-1]]
+            elif mask.shape[-1] < attributions.shape[-1]:
+                attributions = attributions[..., :mask.shape[-1]]
             # attribution energy inside mask
             a_energy = (attributions.abs() * mask).sum().item()
             total = attributions.abs().sum().item() + 1e-12
