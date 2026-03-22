@@ -17,7 +17,7 @@ def test_full_pipeline_flow():
 
     # 1) Build banks
     scales = [(128, 32), (512, 128)]
-    inst_banks = build_multiscale_banks(instrument_ref_dirs, scales=scales, n_atoms_per_scale=8, device=device)
+    inst_banks = build_multiscale_banks(instrument_ref_dirs, scales=scales, n_atoms_per_scale=8, device=device, max_iters=2)
     assert 'violin' in inst_banks
     assert 'flute' in inst_banks
 
@@ -34,13 +34,35 @@ def test_full_pipeline_flow():
     opt = torch.optim.Adam(separator.parameters(), lr=1e-4)
 
     # 5) Train for 1 iteration
-    train_separator(separator, inst_loss_module, loader, opt, device=device, epochs=1)
+    train_separator(separator, inst_loss_module, loader, opt, device=device, epochs=1, max_iters=2)
 
     # Verify we can run prediction
     mix, target, inst_name = next(iter(loader))
     with torch.no_grad():
         pred = separator(mix.to(device))
     assert pred.shape == target.shape
+
+def test_polyphonic_processing():
+    device = 'cpu'
+    # Use the synthesized polyphonic mixtures
+    mixture_files = glob.glob('data/midi_mixtures/*.wav')
+    if not mixture_files:
+        pytest.skip("No polyphonic mock data found. Run setup_mock_data.py first.")
+
+    separator = EnhancedSeparator().to(device)
+    # Load one mixture
+    from multiscale_wavelet_instrument_pipeline import load_mono
+    mix_np = load_mono(mixture_files[0])
+    mix_t = torch.from_numpy(mix_np).unsqueeze(0).unsqueeze(0).float().to(device)
+
+    with torch.no_grad():
+        out_t = separator(mix_t)
+
+    assert out_t.shape == mix_t.shape
+    assert not torch.isnan(out_t).any()
+    # Output should not be silent if input isn't
+    if torch.max(torch.abs(mix_t)) > 1e-4:
+        assert torch.max(torch.abs(out_t)) > 1e-6
 
 def test_epistemic_agent_integration():
     from epi_sep import EpistemicAgent, SmallUNet

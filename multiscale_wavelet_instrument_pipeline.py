@@ -534,7 +534,11 @@ def demo_pipeline(instrument_ref_dirs=None, bg_files=None):
     torch.save(separator.state_dict(), "separator_final.pth")
     # 5) Refine one example with FractalBayesRefiner
     print("Refining one example with FractalBayesRefiner...")
-    refiner = FractalBayesRefiner(inst_banks, device=device)
+    refiner = FractalBayesRefiner(max_level=3)
+    # Train the prior first
+    for inst, info in inst_banks.items():
+        refiner.train_prior(inst, info['ref_signals'])
+
     mix_t, target_t, inst_name = mixture_dataset[0]
     # Ensure 3D input for GainNorm etc
     if mix_t.ndim == 2:
@@ -546,8 +550,8 @@ def demo_pipeline(instrument_ref_dirs=None, bg_files=None):
         pred_t = separator(mix_t.to(device))
         pred_np = pred_t.squeeze(0).squeeze(0).cpu().numpy()
 
-    refined, aux_loss, diag = refiner.refine_prediction(
-        pred_np, target_np, inst_name, inst_banks[inst_name]['banks']
+    refined, aux_loss, diag = refiner.refine(
+        pred_np, inst_name, target_signal=target_np
     )
     print(f"Refinement auxiliary loss: {aux_loss:.6f}, slope: {diag['slope']:.4f}")
 
