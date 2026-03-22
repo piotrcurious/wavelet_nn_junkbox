@@ -40,7 +40,7 @@ def write_wav(path, x, sr=SR):
 
 def random_pitch_shift(x, sr=SR, semitones_range=(-4,4)):
     n = random.uniform(*semitones_range)
-    return librosa.effects.pitch_shift(x, sr, n_steps=n)
+    return librosa.effects.pitch_shift(x, sr=sr, n_steps=n)
 
 def random_reverb(x, sr=SR, reverb_prob=0.8):
     if random.random() > reverb_prob:
@@ -77,7 +77,7 @@ def intermodulation_mix(x, sr=SR):
     for h in [2,3]:
         if random.random() < 0.5:
             pitch = random.choice([+7, -5, +12, -12]) / float(h)
-            copy = librosa.effects.pitch_shift(x, sr, n_steps=pitch)
+            copy = librosa.effects.pitch_shift(x, sr=sr, n_steps=pitch)
             # small delay and attenuation
             att = random.uniform(0.02, 0.2)
             delay = int(random.uniform(0, 0.02)*sr)
@@ -165,7 +165,7 @@ class InstrumentRefDataset(torch.utils.data.Dataset):
             segment = augment_example(segment, sr=self.sr)
         # normalize
         segment = segment / (np.max(np.abs(segment)) + 1e-9)
-        return torch.from_numpy(segment).unsqueeze(0)  # (1, T)
+        return torch.from_numpy(segment).unsqueeze(0).float()  # (1, T)
 
 # ---------------------------
 # Train ConvDictAE for instrument -> obtain atoms
@@ -179,6 +179,8 @@ def train_conv_dict_ae(ref_files, n_atoms=64, atom_len=512, hop=64, epochs=8, ba
         total_loss = 0.0
         for i, batch in enumerate(loader):
             x = batch.to(device)  # (B,1,T)
+            if x.shape[-1] < atom_len:
+                continue
             recon, coeff = model(x)
             # loss = L1 recon + small L1 on coefficients for sparsity
             recon_loss = F.l1_loss(recon, x)
@@ -316,7 +318,7 @@ class DeReverbNet(nn.Module):
         self.net = nn.Sequential(
             nn.Conv1d(1, base, 31, padding=15),
             nn.ReLU(),
-            nn.Conv1d(base, base, 31, padding=15, dilation=2),
+            nn.Conv1d(base, base, 31, padding=30, dilation=2),
             nn.ReLU(),
             nn.Conv1d(base, 1, 31, padding=15),
         )
@@ -341,8 +343,14 @@ class SeparatorUNet(nn.Module):
         e3 = self.act(self.enc3(e2))
         b = self.act(self.bott(e3))
         d3 = self.act(self.dec3(b))
+        # Ensure d3 and e2 have same size
+        if d3.shape[-1] != e2.shape[-1]:
+            d3 = F.interpolate(d3, size=e2.shape[-1], mode='linear', align_corners=False)
         d3 = torch.cat([d3, e2], dim=1)
         d2 = self.act(self.dec2(d3))
+        # Ensure d2 and e1 have same size
+        if d2.shape[-1] != e1.shape[-1]:
+            d2 = F.interpolate(d2, size=e1.shape[-1], mode='linear', align_corners=False)
         d2 = torch.cat([d2, e1], dim=1)
         out = self.outc(d2)
         return out
@@ -380,6 +388,8 @@ def train_separator(separator, inst_loss_module, dataloader, optimizer, device='
         tot = 0.0
         for i, (mix, target, inst_name) in enumerate(dataloader):
             mix = mix.to(device); target = target.to(device)
+            if mix.shape[-1] < 128: # Avoid too small segments
+                continue
             pred = separator(mix)
             time_loss = F.l1_loss(pred, target)
             wave_loss = inst_loss_module(pred, target, inst_name[0])  # assume batch same instrument for simplicity
@@ -464,8 +474,8 @@ def user_feedback_finetune(separator, inst_loss_module, accepted_examples, optim
     separator.train()
     for step in range(steps):
         mix_np, target_np, inst_name = random.choice(accepted_examples)
-        mix = torch.from_numpy(mix_np).unsqueeze(0).to(device)
-        target = torch.from_numpy(target_np).unsqueeze(0).to(device)
+        mix = torch.from_numpy(mix_np).unsqueeze(0).unsqueeze(0).to(device)
+        target = torch.from_numpy(target_np).unsqueeze(0).unsqueeze(0).to(device)
         pred = separator(mix)
         time_loss = F.l1_loss(pred, target)
         wave_loss = inst_loss_module(pred, target, inst_name)
@@ -481,38 +491,40 @@ def user_feedback_finetune(separator, inst_loss_module, accepted_examples, optim
 # ---------------------------
 # Putting it all together (toy run)
 # ---------------------------
-def demo_pipeline():
+def demo_pipeline(instrument_ref_dirs=None, bg_files=None):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    # Replace these placeholders with actual file collections
-    instrument_ref_dirs = {
-        'violin': glob.glob('/path/to/violin_ref/*.wav'),
-        'flute' : glob.glob('/path/to/flute_ref/*.wav'),
-    }
-    bg_files = glob.glob('/path/to/background_scenes/*.wav')
+    # Use provided paths or fall back to defaults
+    if instrument_ref_dirs is None:
+        instrument_ref_dirs = {
+            'violin': glob.glob('data/violin_ref/*.wav'),
+            'flute' : glob.glob('data/flute_ref/*.wav'),
+        }
+    if bg_files is None:
+        bg_files = glob.glob('data/background_scenes/*.wav')
     # 1) Build multiscale banks (training conv-dict per instrument per scale)
     # Scales: (atom_len, hop)
     scales = [(512, 64), (2048, 256)]
-    inst_banks = build_multiscale_banks(instrument_ref_dirs, scales=scales, n_atoms_per_scale=48, device=device)
+    inst_banks = build_multiscale_banks(instrument_ref_dirs, scales=scales, n_atoms_per_scale=8, device=device)
     # 2) Prepare instrument-wavelet loss wrapper
     inst_loss_module = InstrumentWaveletLoss(inst_banks, downsample_factors=[1,4], per_scale_weights=[0.6, 0.4], device=device)
     inst_loss_module.to(device)
     # 3) Train separator
-    mixture_dataset = MixtureDataset(instrument_ref_dirs, bg_files, seg_len=16000, augment=True)
-    loader = torch.utils.data.DataLoader(mixture_dataset, batch_size=4, shuffle=True, num_workers=4)
+    mixture_dataset = MixtureDataset(instrument_ref_dirs, bg_files, seg_len=4096, augment=True)
+    loader = torch.utils.data.DataLoader(mixture_dataset, batch_size=4, shuffle=True, num_workers=2)
     separator = EnhancedSeparator().to(device)
     opt = torch.optim.Adam(separator.parameters(), lr=1e-4)
-    train_separator(separator, inst_loss_module, loader, opt, device=device, epochs=6)
+    train_separator(separator, inst_loss_module, loader, opt, device=device, epochs=1)
     # 4) Simulate user feedback and fine-tune
     # create accepted_examples by running separator on some mix samples and optionally letting user mark them
     accepted = []
-    for i in range(8):
+    for i in range(2):
         mix_t, inst_t, inst_name = mixture_dataset[i]
         mix_np = mix_t.squeeze(0).numpy()
         inst_np = inst_t.squeeze(0).numpy()
         accepted.append((mix_np, inst_np, inst_name))
     # fine-tune with a low lr
     opt2 = torch.optim.Adam(separator.parameters(), lr=1e-5)
-    user_feedback_finetune(separator, inst_loss_module, accepted, opt2, device=device, steps=200)
+    user_feedback_finetune(separator, inst_loss_module, accepted, opt2, device=device, steps=10)
     # Save models and atoms
     torch.save(separator.state_dict(), "separator_final.pth")
     # Save atom banks
